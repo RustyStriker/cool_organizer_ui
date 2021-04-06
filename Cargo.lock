@@ -123,6 +123,7 @@ name = "corganizerui"
 version = "0.1.0"
 dependencies = [
  "cool_organizer",
+ "glib",
  "gtk",
 ]
 
