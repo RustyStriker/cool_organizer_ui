@@ -12,7 +12,7 @@ fn main() {
     let builder = gtk::Builder::from_string(glade_src);
     let ui = get_layout_from_builder(&builder);
 
-    ui.main_window.set_title("Cool Organizer Beautiful Interface");
+    ui.main_window.set_title("Cool Organizer's Beautiful Interface");
 
     let tasks = TasksManager::load(&TasksManager::default_path());
     let tasks = Rc::new(RefCell::new(tasks));
