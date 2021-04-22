@@ -1,4 +1,4 @@
-use gtk::{Button, Entry, prelude::*};
+use gtk::{Button, Entry, TreeIter, TreeModel, prelude::*};
 use cool_organizer::*;
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
@@ -66,12 +66,19 @@ impl UILayout {
     }
 
     fn update_tasks_list(&self, tasks : &TasksManager) {
-        let list = gtk::ListStore::new(&[glib::Type::String]);
+        let model = gtk::TreeStore::new(&[glib::Type::String]);
 
-        for task in tasks.tasks.iter() {
-            list.set(&list.append(), &[0], &[&task.formatted(true)]);
+        let categories = tasks.get_categories();
+
+        for cat in categories.iter() {
+            let parent = model.insert_with_values(None, None, &[0], &[cat]);
+
+            for t in tasks.tasks.iter().filter(|t| t.category == cat.as_str()) {
+                let _ = model.insert_with_values(Some(&parent),None,&[0], &[&t.formatted(true)]);
+            }
         }
-        self.tasks_list.set_model(Some(&list));
+
+        self.tasks_list.set_model(Some(&model));
     }
 
     fn disable_task(&self) {
@@ -107,25 +114,30 @@ impl UILayout {
 
                 match task {
                     Some((model,iter)) => {
-                        let path = model.get_path(&iter).expect("couldnt get path from iter");
-                        let row = *path.get_indices().first().unwrap_or(&-1);
-
-                        if row == -1 {
-                            clone.disable_task();
-                        }
-                        else {
+                        let (tf, cat) = get_selected_data(&model, &iter);
+                        
+                        if tf.is_some() && cat.is_some() {
                             let tasks = tclone.upgrade();
                             match tasks {
-                                Some(t) => clone.update_task(&t.borrow().tasks[row as usize]),
+                                Some(t) => {
+                                    let t = t.borrow();
+                                    let task = find_task_in_list(&t.tasks, &cat.unwrap(),&tf.unwrap());
+                                    if let Some(t) = task {
+                                        clone.update_task(&t);
+                                    }
+                                    else {
+                                        clone.disable_task();
+                                    }
+                                },
                                 None => ()
-                            };
-                        }
+                            }
+                        }                
                     },
                     None => {
                         clone.disable_task();
                     }
                 }
-            });
+        });
         // Connect date being disabled
         let date = self.date.clone();
         self.due.connect_changed_active(move |c| {
@@ -139,14 +151,15 @@ impl UILayout {
             let selector = clone.tasks_list.get_selection();
             match selector.get_selected() {
                 Some((model, iter)) => {
-                    let path = model.get_path(&iter).expect("couldnt get path");
-                    let row = *path.get_indices().first().unwrap_or(&-1);
+                    let (tf, cat) = get_selected_data(&model,&iter);
 
-                    if row != -1 {
+                    if tf.is_some() && cat.is_some() {
+                        let tf = tf.unwrap();
+                        let cat = cat.unwrap();
                         match tclone.upgrade() {
                             Some(t) => {
                                 let mut t = t.borrow_mut();
-                                let mut task = &mut t.tasks[row as usize];
+                                let mut task = find_task_in_list_mut(&mut t.tasks, &cat, &tf).expect("couldnt find the selected task");
                                 
                                 task.name = clone.name.get_text().into();
                                 task.category = clone.category.get_text().into();
@@ -166,9 +179,19 @@ impl UILayout {
                                 task.done = clone.done.get_active();
 
                                 task.priority = clone.prio.get_value() as u8;
+                                let tf = task.formatted(true);
 
-                                clone.update_tasks_list(&*t);
                                 let _ = t.save(&TasksManager::default_path());
+                                drop(t);
+                                // clone.update_tasks_list(&*t);
+                                // im only using TreeStore here so it should work, but if not i will be sad :(
+                                let model : gtk::TreeStore = unsafe {
+                                    // The model should be a treestore tbh
+                                    model.unsafe_cast()
+                                };
+                                model.set_value(&iter, 0, &tf.to_value());
+
+
                             }
                             None => {}
                         }
@@ -185,22 +208,22 @@ impl UILayout {
             let selector = clone.tasks_list.get_selection();
             match selector.get_selected() {
                 Some((model, iter)) => {
-                    let path = model.get_path(&iter).expect("couldnt get path");
-                    let row = *path.get_indices().first().unwrap_or(&-1);
+                    let  (tf, cat) = get_selected_data(&model,&iter);
 
-                    if row != -1 {
+                    if tf.is_some() && cat.is_some() {
+                        let tf = tf.unwrap();
+                        let cat = cat.unwrap();
+
                         match tclone.upgrade() {
                             Some(t) => {
                                 let mut t = t.borrow_mut();
-
-                                let task_string = t.tasks[row as usize].formatted(true);
 
                                 let dia = gtk::MessageDialog::new(
                                     Some(&clone.main_window),
                                     gtk::DialogFlags::DESTROY_WITH_PARENT,
                                     gtk::MessageType::Warning,
                                     gtk::ButtonsType::YesNo,
-                                    &format!("Are you sure you want to delete:\n\t{}", task_string)
+                                    &format!("Are you sure you want to delete:\n\t{}", tf)
                                 );
                                 dia.set_title("Remove Task");
                                 let res = dia.run();
@@ -208,8 +231,19 @@ impl UILayout {
 
                                 match res {
                                     gtk::ResponseType::Yes => {
-                                        t.remove_task(row as usize);
-                                        clone.update_tasks_list(&*t);
+                                        // find the task
+                                        let task_i = t.tasks.iter()
+                                            .enumerate()
+                                            .find(|(_,t)| t.formatted(true) == tf && t.category == cat)
+                                            .map(|(i,_)| i);
+                                        t.remove_task(task_i.unwrap_or(9999));
+
+                                        let model : gtk::TreeStore = unsafe {
+                                            model.unsafe_cast()
+                                        };
+                                        model.remove(&iter);
+                                        clone.disable_task();
+
                                         let _ = t.save(&TasksManager::default_path());
                                     }
                                     _ => ()
@@ -264,13 +298,148 @@ impl UILayout {
             match tclone.upgrade() {
                 Some(t) => {
                     let mut t = t.borrow_mut();
-                    let new = Task::new("new task");
+                    // Make sure we dont already have a 'new task'
+                    let n;
+                    if !t.tasks.iter().any(|t| t.name == "new task") {
+                        let new = Task::new("new task");
+    
+                        t.add_task(new);
+                        clone.update_tasks_list(&*t);
+                        n = t.tasks.len() -1;
+                    }
+                    else {
+                        n = {
+                            let mut res = 0;
+                            for (i,t) in t.tasks.iter().enumerate() {
+                                if t.name == "new task" {
+                                    res = i;
+                                    break;
+                                }
+                            }
+                            res
+                        };
+                    }
+                    // Select the new task
+                    let model = clone.tasks_list.get_model().expect("couldnt get model?!?");
+                    let iter = model.iter_nth_child(None, n as i32);
 
-                    t.add_task(new);
-                    clone.update_tasks_list(&*t);
+                    // Why?
+                    //      Forcefully dorp 't' early because we borrow it here as mut
+                    //      while we want to select(which will enforce another borrow_mut)
+                    // Anyway, dropping it early means we are no longer borrow_mut-ing it!
+                    drop(t);
+
+                    match iter {
+                        Some(t) => {
+                            let selector = clone.tasks_list.get_selection();
+                            selector.select_iter(&t);
+                        }
+                        None => {}
+                    }
+
+
+                    
                 }
                 None => ()
             }
+        });
+
+        // Connect row changed(to see if we need to refresh or not)
+        let clone = self.clone();
+        let tclone = tasks.clone();
+        let model = self.tasks_list.get_model().expect("Couldn't get model wtf");
+        model.connect_row_changed(move |model,_,iter| {
+            let (tf, cat) = get_selected_data(model,iter);
+            if tf.is_some() && cat.is_some() {
+                let tf = tf.unwrap();
+                let cat = cat.unwrap();
+
+                let parent_path = {
+                    let mut path = model.get_path(&iter).expect("couldn't get path");
+                    let _ = path.up();
+                    path
+                };
+                // Do stuff with the task
+                match tclone.upgrade() {
+                    Some(manager) => {
+                        let manager = manager.borrow();
+                        let task = manager.tasks.iter()
+                            .find(|t| t.formatted(true) == tf);
+                        
+                        if task.is_some() {
+                            let task = task.unwrap();
+                            if task.category != cat {
+                                // move the task to a new category
+                                let model : gtk::TreeStore = unsafe {
+                                    model.clone().unsafe_cast()
+                                };
+                                let clean_iter = model.get_iter_first().expect("couldnt get iter");
+                                let mut wanted_parent = None;
+                                loop {
+                                    if !model.iter_next(&clean_iter) {
+                                        break;
+                                    }
+                                    let path = model.get_path(&clean_iter).unwrap();
+                                    // Check if this is a category
+                                    if path.get_depth() == 1 {
+                                        let cat : Result<Option<String>,_> = model.get_value(&clean_iter,0).get();
+                                        if cat == Ok(Some(task.category.clone())) {
+                                            // Get to its children
+                                            wanted_parent = Some(clean_iter);
+                                            break;
+                                            
+                                        }
+                                    }
+                                }
+                                match wanted_parent {
+                                    Some(new_pos) => {
+                                        let _ = model.remove(&iter);
+                                        let select = model.insert_with_values(Some(&new_pos), None, &[0],&[&task.formatted(true)]);
+                                        clone.tasks_list.get_selection().select_iter(&select);
+                                    },
+                                    None => {
+                                        // we need to create a new category
+                                        let cat = &task.category;
+                                        let parent = model.insert_with_values(None, None, &[0],&[&cat]);
+
+                                        let _ = model.remove(&iter);
+                                        let select = model.insert_with_values(Some(&parent), None, &[0],&[&task.formatted(true)]);
+                                        clone.tasks_list.get_selection().select_iter(&select);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    None => {}
+                }
+            
+                // Check if the parent needs to be removed
+                let parent_iter = model.get_iter(&parent_path).expect("couldnt get path");
+                if model.iter_n_children(Some(&parent_iter)) == 0 {
+                    let model : gtk::TreeStore = unsafe {
+                        model.clone().unsafe_cast()
+                    };
+                    model.remove(&parent_iter);
+                }
+            }
+        });
+
+        model.connect_row_deleted(|model, path| {
+            let parent_path = {
+                let mut path = path.clone();
+                path.up();
+                path
+            };
+            let iter = model.get_iter(&parent_path);
+            if let Some(iter) = iter {
+                if model.iter_n_children(Some(&iter)) == 0 {
+                    let model : gtk::TreeStore = unsafe {
+                        model.clone().unsafe_cast()
+                    };
+                    model.remove(&iter);
+                }
+            }
+
         });
     }
 }
@@ -292,4 +461,30 @@ fn get_layout_from_builder(builder : &gtk::Builder) -> UILayout {
         done : builder.get_object("task_done").expect("task_done is missing"),
         prio : builder.get_object("task_prio").expect("task_prio is missing"),
     }
+}
+
+/// Returns the formatted task and category - (Option(task_formatted),Option<cat>)
+fn get_selected_data(model : &TreeModel, iter :&TreeIter) -> (Option<String>,Option<String>) {
+    let mut path = model.get_path(&iter).expect("couldnt get path from iter");
+
+    if path.get_depth() > 1 {
+        let _ = path.up();
+        let cat = model.get_iter(&path).expect("couldnt get category");
+        let cat : Result<Option<String>,_> = model.get_value(&cat, 0).get();
+        let formatted : Result<Option<String>,_> = model.get_value(&iter,0).get();
+
+        // Make sure we have both a normal task and category
+        if formatted.is_ok() && cat.is_ok() {
+            return (formatted.unwrap(), cat.unwrap());
+        }
+
+    }
+    (None,None)
+}
+
+fn find_task_in_list<'a>(task_list : &'a Vec<Task>, cat : &str, formatted_task : &str) -> Option<&'a Task> {
+    task_list.iter().find(|t| t.category == cat && t.formatted(true) == formatted_task)
+}
+fn find_task_in_list_mut<'a>(task_list : &'a mut Vec<Task>, cat : &str, formatted_task : &str) -> Option<&'a mut Task> {
+    task_list.iter_mut().find(|t| t.category == cat && t.formatted(true) == formatted_task)
 }
