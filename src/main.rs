@@ -241,10 +241,14 @@ impl UILayout {
                                         let model : gtk::TreeStore = unsafe {
                                             model.unsafe_cast()
                                         };
-                                        model.remove(&iter);
                                         clone.disable_task();
-
+                                        
                                         let _ = t.save(&TasksManager::default_path());
+                                        
+                                        // Upon calling `model.remove` the `selection changed` closure will be envoked
+                                        // which borrows the tasks manager, thus we need to drop beforehand 
+                                        drop(t); 
+                                        model.remove(&iter);
                                     }
                                     _ => ()
 
